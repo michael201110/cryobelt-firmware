@@ -35,6 +35,9 @@ constexpr uint32_t BLE_TELEMETRY_PERIOD_MS = 1000;
 constexpr bool AUDIO_HARDWARE_REWORKED = true;
 constexpr uint32_t AUDIO_SAMPLE_RATE_HZ = 16000;
 constexpr uint8_t AUDIO_STARTUP_VOLUME_PERCENT = 10;
+constexpr uint32_t FIND_BELT_DURATION_MS = 8000;
+constexpr uint32_t FIND_BELT_FLASH_PERIOD_MS = 250;
+constexpr uint8_t FIND_BELT_VOLUME_PERCENT = 18;
 
 // Fan current-sense:
 // Rshunt = 0.05 ohm

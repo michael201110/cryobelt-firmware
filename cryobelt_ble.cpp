@@ -35,7 +35,9 @@ class CommandCallbacks final : public BLECharacteristicCallbacks {
       (opcode == static_cast<uint8_t>(CryoBeltBLE::Opcode::SET_FAN_PERCENT) &&
        commandValue <= 100) ||
       (opcode == static_cast<uint8_t>(CryoBeltBLE::Opcode::SET_MODE) &&
-       commandValue <= 3);
+       commandValue <= 3) ||
+      (opcode == static_cast<uint8_t>(CryoBeltBLE::Opcode::FIND_BELT) &&
+       commandValue == 1);
     if (!valid) return;
 
     portENTER_CRITICAL(&stateMux);

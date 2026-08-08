@@ -27,7 +27,8 @@ firmware advertises as `CryoBelt` and exposes service
 
 - Command characteristic `...1001` accepts exactly three bytes: protocol
   version (`1`), opcode, and value. Opcodes are power (`1`, value 0/1), fan
-  percent (`2`, value 0-100), and mode (`3`, value 0-3).
+  percent (`2`, value 0-100), mode (`3`, value 0-3), and Find My Belt
+  (`4`, value 1).
 - Telemetry characteristic `...1002` is readable and notifiable. Its fixed
   16-byte packet carries state flags, requested/actual fan level, mode, USB
   role, temperature, humidity, fan current, battery voltage, and BQ25895
@@ -36,6 +37,10 @@ firmware advertises as `CryoBelt` and exposes service
 Cooling is switched off when the BLE client disconnects. Remote commands never
 enable charging or OTG; those remain governed by the firmware safety
 interlocks.
+
+Find My Belt flashes the three status LEDs blue and emits a short chirp once per
+second for eight seconds. It stops automatically or immediately on BLE
+disconnect and does not change the cooling, charging, or OTG state.
 
 ## Library required
 

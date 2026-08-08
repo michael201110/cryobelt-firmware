@@ -10,6 +10,7 @@ public:
     SET_POWER = 1,
     SET_FAN_PERCENT = 2,
     SET_MODE = 3,
+    FIND_BELT = 4,
   };
 
   enum class Mode : uint8_t {

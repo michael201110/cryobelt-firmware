@@ -57,12 +57,62 @@ static bool chargerConfigValid = false;
 static uint16_t batteryMillivolts = 0;
 static uint8_t chargerStatus = 0;
 static uint8_t chargerFault = 0;
+static uint8_t statusRed = 0;
+static uint8_t statusGreen = 0;
+static uint8_t statusBlue = 0;
+static bool findBeltActive = false;
+static uint32_t findBeltStartedMs = 0;
+static uint32_t findBeltLastStep = UINT32_MAX;
 
-static void setStatusColour(uint8_t r, uint8_t g, uint8_t b) {
+static void showPixels(uint8_t r, uint8_t g, uint8_t b) {
   for (uint8_t i = 0; i < RGB_COUNT; ++i) {
     pixels.setPixelColor(i, pixels.Color(r, g, b));
   }
   pixels.show();
+}
+
+static void setStatusColour(uint8_t r, uint8_t g, uint8_t b) {
+  statusRed = r;
+  statusGreen = g;
+  statusBlue = b;
+  showPixels(r, g, b);
+}
+
+static void stopFindBelt() {
+  if (!findBeltActive) return;
+  findBeltActive = false;
+  showPixels(statusRed, statusGreen, statusBlue);
+}
+
+static void startFindBelt() {
+  findBeltActive = true;
+  findBeltStartedMs = millis();
+  findBeltLastStep = UINT32_MAX;
+  Serial.println("[FIND] Locator alert started.");
+}
+
+static void updateFindBelt() {
+  if (!findBeltActive) return;
+
+  const uint32_t elapsed = millis() - findBeltStartedMs;
+  if (elapsed >= FIND_BELT_DURATION_MS) {
+    stopFindBelt();
+    Serial.println("[FIND] Locator alert finished.");
+    return;
+  }
+
+  const uint32_t step = elapsed / FIND_BELT_FLASH_PERIOD_MS;
+  if (step == findBeltLastStep) return;
+  findBeltLastStep = step;
+
+  if ((step & 1U) == 0) {
+    showPixels(0, 80, 255);
+    if ((step % 4U) == 0) {
+      audio.playTone(1320, 55, FIND_BELT_VOLUME_PERCENT);
+    }
+  } else {
+    showPixels(0, 0, 0);
+  }
 }
 
 static uint8_t effectiveFanPercent() {
@@ -88,6 +138,7 @@ static void applyCoolingOutput() {
 
 static void handleBleCommands() {
   if (beltBLE.takeDisconnected()) {
+    stopFindBelt();
     coolingEnabled = false;
     applyCoolingOutput();
     Serial.println("[BLE] Disconnected; cooling stopped.");
@@ -105,6 +156,9 @@ static void handleBleCommands() {
         break;
       case CryoBeltBLE::Opcode::SET_MODE:
         coolingMode = static_cast<CryoBeltBLE::Mode>(command.value);
+        break;
+      case CryoBeltBLE::Opcode::FIND_BELT:
+        startFindBelt();
         break;
     }
     applyCoolingOutput();
@@ -137,6 +191,7 @@ static void publishBleTelemetry() {
 }
 
 static void forceChargerSafe() {
+  stopFindBelt();
   chargerConfigValid = false;
   // Best effort, deliberately ordered so the hardware ILIM clamp is restored
   // even if another register transaction fails.
@@ -284,6 +339,7 @@ void loop() {
   buttons.update();
   usbRole.update();
   handleBleCommands();
+  updateFindBelt();
 
   // Simple UI:
   // UP   = +10% fan
