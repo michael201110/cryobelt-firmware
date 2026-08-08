@@ -5,8 +5,9 @@ void FUSB303GPIO::begin(uint8_t idPin, uint8_t out1Pin, uint8_t out2Pin) {
   out1Pin_ = out1Pin;
   out2Pin_ = out2Pin;
 
-  // FUSB303B GPIO outputs are open-drain in these modes, so internal pull-ups
-  // provide readable HIGH when the output is high-Z.
+  // ID and the sink-mode OUT signals are open-drain. Rev-A has no external
+  // pulls on these three nets, so the ESP pull-ups are required. In source
+  // mode OUT1/OUT2 become inputs; the same pulls select default source current.
   pinMode(idPin_, INPUT_PULLUP);
   pinMode(out1Pin_, INPUT_PULLUP);
   pinMode(out2Pin_, INPUT_PULLUP);
@@ -27,17 +28,18 @@ void FUSB303GPIO::update() {
     else if (!out1 && !out2) role_ = Role::SOURCE_3A;
     else role_ = Role::RESERVED;
   } else {
-    // OUT1=HIGH, OUT2=LOW also represents "no device attached".
-    // Without an additional attach signal, keep that grouped with default/no-attach.
-    if (!out1 &&  out2) role_ = Role::SINK_1_5A;
+    if ( out1 && !out2) role_ = Role::NONE;
+    else if (out1 && out2) role_ = Role::SINK_DEFAULT;
+    else if (!out1 &&  out2) role_ = Role::SINK_1_5A;
     else if (!out1 && !out2) role_ = Role::SINK_3A;
-    else role_ = Role::NONE_OR_SINK_DEFAULT;
+    else role_ = Role::RESERVED;
   }
 }
 
 const char* FUSB303GPIO::description() const {
   switch (role_) {
-    case Role::NONE_OR_SINK_DEFAULT: return "none/sink-default";
+    case Role::NONE:                 return "none";
+    case Role::SINK_DEFAULT:         return "sink-default";
     case Role::SINK_1_5A:            return "sink-1.5A";
     case Role::SINK_3A:              return "sink-3A";
     case Role::SOURCE_DEFAULT:       return "source-default";

@@ -4,7 +4,8 @@
 class FUSB303GPIO {
 public:
   enum class Role {
-    NONE_OR_SINK_DEFAULT,
+    NONE,
+    SINK_DEFAULT,
     SINK_1_5A,
     SINK_3A,
     SOURCE_DEFAULT,
@@ -22,5 +23,5 @@ private:
   uint8_t idPin_ = 255;
   uint8_t out1Pin_ = 255;
   uint8_t out2Pin_ = 255;
-  Role role_ = Role::NONE_OR_SINK_DEFAULT;
+  Role role_ = Role::NONE;
 };

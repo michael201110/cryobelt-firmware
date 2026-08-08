@@ -6,8 +6,8 @@ Initial firmware skeleton for the custom CryoBelt ESP32-S3-MINI-1-N8 PCB.
 
 - Native USB serial logging
 - I2C on GPIO9/GPIO8
-- BQ25895 detection and safe boot configuration
-- ESP-authorised charging
+- BQ25895 identity checking and verified fail-closed boot configuration
+- Dual-interlock ESP-authorised charging (disabled by default)
 - SHT40 temperature/humidity readings
 - Fan PWM on GPIO13
 - INA180A3 fan-current reading on GPIO14
@@ -16,6 +16,26 @@ Initial firmware skeleton for the custom CryoBelt ESP32-S3-MINI-1-N8 PCB.
 - FUSB303B GPIO-mode role/current-state reading
 - 12V boost enable control
 - OTG gate defaults safely OFF
+- Bluetooth LE control and telemetry for the companion Flutter app
+- MAX98357A I2S audio on reworked Rev-A boards
+
+## Companion app and BLE protocol
+
+The companion Flutter project is in the sibling `cryobelt_app` repository. The
+firmware advertises as `CryoBelt` and exposes service
+`7d4b1000-6c4a-4f65-9f09-8a2c7d3e1000`.
+
+- Command characteristic `...1001` accepts exactly three bytes: protocol
+  version (`1`), opcode, and value. Opcodes are power (`1`, value 0/1), fan
+  percent (`2`, value 0-100), and mode (`3`, value 0-3).
+- Telemetry characteristic `...1002` is readable and notifiable. Its fixed
+  16-byte packet carries state flags, requested/actual fan level, mode, USB
+  role, temperature, humidity, fan current, battery voltage, and BQ25895
+  status/fault bytes.
+
+Cooling is switched off when the BLE client disconnects. Remote commands never
+enable charging or OTG; those remain governed by the firmware safety
+interlocks.
 
 ## Library required
 
@@ -74,20 +94,26 @@ At power-up, EN_ILIM defaults enabled, so an open ILIM hardware pin prevents nor
 2. explicitly disables charging;
 3. explicitly disables BQ OTG;
 4. sets the desired I2C input-current limit;
-5. disables ILIM-pin limiting (`EN_ILIM = 0`);
-6. only then enables charging.
+5. disables autonomous DPDM/HVDCP/MaxCharge/ICO behavior because the BQ D+/D- pins are unconnected on Rev-A;
+6. programs and reads back the complete provisional charge profile;
+7. disables the BQ I2C watchdog so it cannot restore unsafe register defaults after 40 seconds;
+8. leaves the hardware ILIM clamp enabled unless both charge-authorisation interlocks are true;
+9. only then disables ILIM-pin limiting and enables charging.
 
-`CHARGE_INPUT_LIMIT_MA` and `ALLOW_CHARGING_AFTER_BOOT` are in `config.h`.
+The input limit, validated battery envelope, conservative bring-up profile, and both authorisation interlocks are in `config.h`. The current battery specification is a 4000 mAh, single-cell 3.7 V nominal Li-ion pack rated for charging at up to 1C. Firmware initially limits fast-charge current to 960 mA (0.24C), while the 500 mA USB input limit remains the tighter practical limit.
 
 For first bench bring-up, it is sensible to set:
 
 ```cpp
+constexpr bool CHARGER_PROFILE_VALIDATED = true;
 constexpr bool ALLOW_CHARGING_AFTER_BOOT = false;
 ```
 
-until the charger section has been inspected and tested.
+`ALLOW_CHARGING_AFTER_BOOT` must remain false until the charger section has been bench tested with a current-limited supply. Raising either the input or charge-current limit also requires PCB thermal validation.
 
-## IMPORTANT Rev-A net conflict found in supplied netlist
+The fan and 12 V boost also remain off after boot. Press USER to start the fan at the configured default level.
+
+## Rev-A audio rework
 
 The supplied PCB/netlist connects:
 
@@ -97,11 +123,14 @@ The supplied PCB/netlist connects:
 
 to the same net `/ESP32-S3/DOUT`.
 
-That means GPIO18 cannot safely be driven as I2S audio data while the final RGB LED output is also driving the same copper net.
+The affected board has been reworked by cutting the final SK6805 DOUT trace.
+Continuity testing confirmed that GPIO18 remains connected to MAX98357A `DIN`
+and is isolated from D3 `DOUT`. The firmware therefore enables I2S and plays a
+short, low-volume two-tone confirmation during startup.
 
-For that reason, this firmware does **not** initialise the MAX98357A.
-
-Review the hardware before enabling audio. Possible Rev-A rework would depend on the physical routing and intended design.
+Do not flash this audio-enabled configuration onto an unreworked Rev-A board.
+Set `AUDIO_HARDWARE_REWORKED` to `false` in `config.h` for any PCB that has not
+had the trace cut and verified.
 
 ## First hardware bring-up order
 
@@ -117,7 +146,8 @@ Recommended sequence once components arrive:
 8. Test fan stage at low duty.
 9. Test LEDs/buttons.
 10. Test charging at a conservative current.
-11. Leave OTG and audio until the rest is proven.
+11. Test audio only after verifying the GPIO18/D3-DOUT rework.
+12. Leave OTG disabled until the rest is proven.
 
 ## Current-sense conversion
 

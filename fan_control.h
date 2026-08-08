@@ -11,5 +11,7 @@ public:
 private:
   uint8_t pwmPin_ = 255;
   uint8_t currentPin_ = 255;
+  uint8_t pwmChannel_ = 0;
+  bool pwmAttached_ = false;
   int percent_ = 0;
 };

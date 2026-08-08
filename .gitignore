@@ -30,3 +30,7 @@
 *.exe
 *.out
 *.app
+
+# PlatformIO build and editor state
+.pio/
+.vscode/

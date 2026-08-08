@@ -1,7 +1,7 @@
 /*
   CryoBelt Rev-A firmware skeleton
   Target: ESP32-S3-MINI-1-N8
-  Framework: Arduino-ESP32 3.x
+  Framework: Arduino-ESP32 2.x or 3.x
 
   Hardware pin map is taken from the CryoBelt KiCad netlist supplied by Michael.
 
@@ -10,8 +10,8 @@
   - Firmware keeps charging disabled while configuring the charger, then disables
     ILIM control and explicitly authorises charging.
   - OTG is OFF by default.
-  - Audio is intentionally disabled: the supplied Rev-A netlist ties GPIO18 /
-    MAX98357A DIN to the DOUT of the final SK6805. See README.md.
+  - This board has the Rev-A GPIO18 / final-SK6805-DOUT conflict repaired by
+    cutting the D3 DOUT trace. Audio must not be enabled on an unreworked PCB.
 */
 
 #include <Arduino.h>
@@ -25,12 +25,16 @@
 #include "fan_control.h"
 #include "fusb303_gpio.h"
 #include "buttons.h"
+#include "cryobelt_ble.h"
+#include "audio_output.h"
 
 BQ25895 charger(Wire);
 SHT40Simple climate(Wire);
 FanControl fans;
 FUSB303GPIO usbRole;
 Buttons buttons;
+CryoBeltBLE beltBLE;
+AudioOutput audio;
 
 Adafruit_NeoPixel pixels(
   RGB_COUNT,
@@ -39,13 +43,107 @@ Adafruit_NeoPixel pixels(
 );
 
 static uint32_t lastTelemetryMs = 0;
+static uint32_t lastBleTelemetryMs = 0;
 static uint32_t lastButtonMs = 0;
+static bool chargingAuthorised = false;
+static bool coolingEnabled = false;
+static uint8_t requestedFanPercent = DEFAULT_FAN_PERCENT;
+static CryoBeltBLE::Mode coolingMode = CryoBeltBLE::Mode::MANUAL;
+static bool climateValid = false;
+static float lastTemperatureC = NAN;
+static float lastHumidityPercent = NAN;
+static float lastFanCurrentAmps = 0.0f;
+static bool chargerConfigValid = false;
+static uint16_t batteryMillivolts = 0;
+static uint8_t chargerStatus = 0;
+static uint8_t chargerFault = 0;
 
 static void setStatusColour(uint8_t r, uint8_t g, uint8_t b) {
   for (uint8_t i = 0; i < RGB_COUNT; ++i) {
     pixels.setPixelColor(i, pixels.Color(r, g, b));
   }
   pixels.show();
+}
+
+static uint8_t effectiveFanPercent() {
+  if (!coolingEnabled) return 0;
+  switch (coolingMode) {
+    case CryoBeltBLE::Mode::QUIET:
+      return requestedFanPercent < 30 ? requestedFanPercent : 30;
+    case CryoBeltBLE::Mode::AUTO:
+      return DEFAULT_FAN_PERCENT;
+    case CryoBeltBLE::Mode::MAXIMUM:
+      return 100;
+    case CryoBeltBLE::Mode::MANUAL:
+    default:
+      return requestedFanPercent;
+  }
+}
+
+static void applyCoolingOutput() {
+  const uint8_t percent = effectiveFanPercent();
+  fans.setPercent(percent);
+  digitalWrite(PIN_12V_EN, percent > 0 ? HIGH : LOW);
+}
+
+static void handleBleCommands() {
+  if (beltBLE.takeDisconnected()) {
+    coolingEnabled = false;
+    applyCoolingOutput();
+    Serial.println("[BLE] Disconnected; cooling stopped.");
+  }
+
+  CryoBeltBLE::Command command;
+  while (beltBLE.takeCommand(command)) {
+    switch (command.opcode) {
+      case CryoBeltBLE::Opcode::SET_POWER:
+        coolingEnabled = command.value != 0;
+        break;
+      case CryoBeltBLE::Opcode::SET_FAN_PERCENT:
+        requestedFanPercent = command.value;
+        coolingMode = CryoBeltBLE::Mode::MANUAL;
+        break;
+      case CryoBeltBLE::Opcode::SET_MODE:
+        coolingMode = static_cast<CryoBeltBLE::Mode>(command.value);
+        break;
+    }
+    applyCoolingOutput();
+    Serial.printf("[BLE] Power=%s Fan=%u%% Mode=%u\n",
+                  coolingEnabled ? "ON" : "OFF",
+                  requestedFanPercent,
+                  static_cast<unsigned>(coolingMode));
+  }
+}
+
+static void publishBleTelemetry() {
+  CryoBeltBLE::Telemetry telemetry = {
+    coolingEnabled,
+    climateValid,
+    charger.isPresent(),
+    chargerConfigValid,
+    chargingAuthorised,
+    requestedFanPercent,
+    static_cast<uint8_t>(fans.percent()),
+    coolingMode,
+    static_cast<uint8_t>(usbRole.role()),
+    lastTemperatureC,
+    lastHumidityPercent,
+    lastFanCurrentAmps,
+    batteryMillivolts,
+    chargerStatus,
+    chargerFault,
+  };
+  beltBLE.publish(telemetry);
+}
+
+static void forceChargerSafe() {
+  chargerConfigValid = false;
+  // Best effort, deliberately ordered so the hardware ILIM clamp is restored
+  // even if another register transaction fails.
+  charger.setPowerModes(false, false);
+  charger.setILIMPinEnabled(true);
+  charger.disableAutonomousInputDetection();
+  charger.disableWatchdog();
 }
 
 static void initialiseChargerSafely() {
@@ -59,66 +157,110 @@ static void initialiseChargerSafely() {
 
   Serial.println("[BQ] Found.");
 
-  // First action: explicitly turn both charger and BQ boost/OTG off.
-  // Open ILIM prevents normal input current before firmware clears EN_ILIM.
-  bool ok = true;
-  ok &= charger.setChargingEnabled(false);
-  ok &= charger.setOTGEnabled(false);
+  // First establish the fail-closed state. The open ILIM pin clamps input
+  // current while EN_ILIM remains enabled.
+  bool ok = charger.setPowerModes(false, false);
+  ok = charger.setILIMPinEnabled(true) && ok;
 
-  // Set I2C input current limit while ILIM is still enabled/open.
-  ok &= charger.setInputCurrentLimitmA(CHARGE_INPUT_LIMIT_MA);
-
-  // Hand input-current control to I2C.
-  ok &= charger.setILIMPinEnabled(false);
-
-  // Keep charging off unless explicitly authorised below.
-  if (ALLOW_CHARGING_AFTER_BOOT) {
-    ok &= charger.setChargingEnabled(true);
-  }
-
-  if (ok) {
-    Serial.printf("[BQ] Configured. Charge=%s, IINLIM=%u mA\n",
-                  ALLOW_CHARGING_AFTER_BOOT ? "ON" : "OFF",
-                  CHARGE_INPUT_LIMIT_MA);
-    setStatusColour(0, 20, 0);
-  } else {
-    Serial.println("[BQ] Configuration failed. Charging left OFF.");
-    charger.setChargingEnabled(false);
+  if (!ok) {
+    Serial.println("[BQ] Could not establish safe state.");
+    forceChargerSafe();
     setStatusColour(32, 0, 0);
+    return;
   }
+
+  // D+/D- on the BQ25895 are unconnected on Rev-A. Disable autonomous input
+  // negotiation and ICO so IINLIM remains the deterministic effective limit.
+  ok = charger.disableAutonomousInputDetection();
+  ok = charger.setInputCurrentLimitmA(CHARGE_INPUT_LIMIT_MA) && ok;
+  ok = charger.setInputVoltageLimitmV(INPUT_VOLTAGE_LIMIT_MV) && ok;
+  ok = charger.setChargeCurrentmA(CHARGE_CURRENT_MA) && ok;
+  ok = charger.setChargeVoltagemV(CHARGE_VOLTAGE_MV) && ok;
+  ok = charger.setPrechargeCurrentmA(PRECHARGE_CURRENT_MA) && ok;
+  ok = charger.setTerminationCurrentmA(TERMINATION_CURRENT_MA) && ok;
+  ok = charger.configureSafetyTimer() && ok;
+  ok = charger.disableWatchdog() && ok;
+  ok = charger.enableContinuousADC() && ok;
+
+  if (!ok || !charger.verifyConfiguration(false, &Serial)) {
+    Serial.println("[BQ] Configuration failed. Charging remains inhibited.");
+    forceChargerSafe();
+    setStatusColour(32, 0, 0);
+    return;
+  }
+
+  chargingAuthorised = CHARGER_PROFILE_VALIDATED && ALLOW_CHARGING_AFTER_BOOT;
+  if (chargingAuthorised) {
+    // Remove the hardware clamp only after every setting has been verified.
+    ok = charger.setILIMPinEnabled(false);
+    ok = charger.setChargingEnabled(true) && ok;
+    ok = ok && charger.verifyConfiguration(true, &Serial);
+  }
+
+  if (!ok) {
+    Serial.println("[BQ] Charge authorisation failed. Restoring safe state.");
+    chargingAuthorised = false;
+    forceChargerSafe();
+    setStatusColour(32, 0, 0);
+    return;
+  }
+
+  chargerConfigValid = true;
+
+  Serial.printf("[BQ] Configured. Charge=%s, IINLIM=%u mA, ICHG=%u mA\n",
+                chargingAuthorised ? "ON" : "INHIBITED",
+                CHARGE_INPUT_LIMIT_MA,
+                CHARGE_CURRENT_MA);
+  setStatusColour(chargingAuthorised ? 0 : 20,
+                  chargingAuthorised ? 20 : 12,
+                  0);
 }
 
 void setup() {
+  // Establish safe control levels before USB startup, logging, or delays.
+  digitalWrite(PIN_12V_EN, LOW);
+  pinMode(PIN_12V_EN, OUTPUT);
+
+  digitalWrite(PIN_OTG_GATE, LOW);
+  pinMode(PIN_OTG_GATE, OUTPUT);
+
+  digitalWrite(PIN_FAN_GATE, LOW);
+  pinMode(PIN_FAN_GATE, OUTPUT);
+
   // Native USB CDC is convenient on ESP32-S3 when USB D+/D- are wired to GPIO20/19.
   Serial.begin(115200);
-  delay(800);
 
   Serial.println();
   Serial.println("================================");
   Serial.println("       CryoBelt Rev-A");
   Serial.println("================================");
 
-  pinMode(PIN_12V_EN, OUTPUT);
-  digitalWrite(PIN_12V_EN, LOW);
-
-  pinMode(PIN_OTG_GATE, OUTPUT);
-  digitalWrite(PIN_OTG_GATE, LOW);
-
   pinMode(PIN_BQ_INT_N, INPUT_PULLUP);
 
-  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, I2C_FREQUENCY_HZ);
+  Wire.setTimeOut(I2C_TIMEOUT_MS);
+  if (!Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, I2C_FREQUENCY_HZ)) {
+    Serial.println("[I2C] Bus initialisation failed.");
+  }
 
   pixels.begin();
   pixels.clear();
-  pixels.setBrightness(RGB_BRIGHTNESS);
+  pixels.setBrightness(STATUS_LED_BRIGHTNESS);
   setStatusColour(0, 0, 12);
+
+  initialiseChargerSafely();
 
   buttons.begin();
   fans.begin(PIN_FAN_GATE, PIN_FAN_CURRENT);
 
   usbRole.begin(PIN_FUSB_ID, PIN_FUSB_OUT1, PIN_FUSB_OUT2);
 
-  initialiseChargerSafely();
+  if (AUDIO_HARDWARE_REWORKED && audio.begin()) {
+    Serial.println("[AUDIO] MAX98357A I2S output enabled.");
+    audio.playTone(880, 70, AUDIO_STARTUP_VOLUME_PERCENT);
+    audio.playTone(1175, 90, AUDIO_STARTUP_VOLUME_PERCENT);
+  } else {
+    Serial.println("[AUDIO] Disabled or I2S initialisation failed.");
+  }
 
   if (climate.begin()) {
     Serial.println("[SHT40] Found.");
@@ -126,8 +268,14 @@ void setup() {
     Serial.println("[SHT40] Not found (expected until hardware is assembled).");
   }
 
-  fans.setPercent(DEFAULT_FAN_PERCENT);
-  digitalWrite(PIN_12V_EN, DEFAULT_FAN_PERCENT > 0 ? HIGH : LOW);
+  // Keep the boost and fan off until the user explicitly requests airflow.
+  applyCoolingOutput();
+
+  if (beltBLE.begin()) {
+    Serial.println("[BLE] Advertising as CryoBelt.");
+  } else {
+    Serial.println("[BLE] Initialisation failed; local controls remain available.");
+  }
 
   Serial.println("[BOOT] Firmware ready.");
 }
@@ -135,6 +283,7 @@ void setup() {
 void loop() {
   buttons.update();
   usbRole.update();
+  handleBleCommands();
 
   // Simple UI:
   // UP   = +10% fan
@@ -142,27 +291,28 @@ void loop() {
   // USER = fan off/on using default level
   if (millis() - lastButtonMs > 50) {
     if (buttons.upPressed()) {
-      fans.setPercent(min(100, fans.percent() + 10));
-      digitalWrite(PIN_12V_EN, fans.percent() > 0 ? HIGH : LOW);
-      Serial.printf("[UI] Fan %d%%\n", fans.percent());
+      requestedFanPercent = requestedFanPercent <= 90
+        ? requestedFanPercent + 10 : 100;
+      coolingMode = CryoBeltBLE::Mode::MANUAL;
+      coolingEnabled = requestedFanPercent > 0;
+      applyCoolingOutput();
+      Serial.printf("[UI] Fan %u%%\n", requestedFanPercent);
       lastButtonMs = millis();
     }
 
     if (buttons.downPressed()) {
-      fans.setPercent(max(0, fans.percent() - 10));
-      digitalWrite(PIN_12V_EN, fans.percent() > 0 ? HIGH : LOW);
-      Serial.printf("[UI] Fan %d%%\n", fans.percent());
+      requestedFanPercent = requestedFanPercent >= 10
+        ? requestedFanPercent - 10 : 0;
+      coolingMode = CryoBeltBLE::Mode::MANUAL;
+      coolingEnabled = requestedFanPercent > 0;
+      applyCoolingOutput();
+      Serial.printf("[UI] Fan %u%%\n", requestedFanPercent);
       lastButtonMs = millis();
     }
 
     if (buttons.userPressed()) {
-      if (fans.percent() == 0) {
-        fans.setPercent(DEFAULT_FAN_PERCENT);
-        digitalWrite(PIN_12V_EN, HIGH);
-      } else {
-        fans.setPercent(0);
-        digitalWrite(PIN_12V_EN, LOW);
-      }
+      coolingEnabled = !coolingEnabled;
+      applyCoolingOutput();
       Serial.printf("[UI] Fan %d%%\n", fans.percent());
       lastButtonMs = millis();
     }
@@ -171,24 +321,42 @@ void loop() {
   if (millis() - lastTelemetryMs >= TELEMETRY_PERIOD_MS) {
     lastTelemetryMs = millis();
 
-    float tempC = NAN;
-    float humidity = NAN;
-    bool shtOK = climate.read(tempC, humidity);
+    climateValid = climate.read(lastTemperatureC, lastHumidityPercent);
+    lastFanCurrentAmps = fans.currentAmps();
 
     Serial.printf("[TEL] Fan=%d%%  I_fan=%.3f A  USB=%s",
                   fans.percent(),
-                  fans.currentAmps(),
+                  lastFanCurrentAmps,
                   usbRole.description());
 
-    if (shtOK) {
-      Serial.printf("  T=%.2f C  RH=%.1f%%", tempC, humidity);
+    if (climateValid) {
+      Serial.printf("  T=%.2f C  RH=%.1f%%", lastTemperatureC, lastHumidityPercent);
     }
 
     if (charger.isPresent()) {
-      Serial.printf("  BQ_INT=%d", digitalRead(PIN_BQ_INT_N));
+      chargerConfigValid = charger.verifyConfiguration(chargingAuthorised, &Serial);
+      if (!chargerConfigValid) {
+        Serial.print("  BQ_CONFIG=INVALID");
+        chargingAuthorised = false;
+        forceChargerSafe();
+        setStatusColour(32, 0, 0);
+      } else if (charger.readStatus(chargerStatus, chargerFault)) {
+        if (!charger.readBatteryMillivolts(batteryMillivolts)) {
+          batteryMillivolts = 0;
+        }
+        Serial.printf("  BQ_STATUS=0x%02X  BQ_FAULT=0x%02X  VBAT=%u mV",
+                      chargerStatus, chargerFault, batteryMillivolts);
+      } else {
+        Serial.print("  BQ_READ=ERROR");
+      }
     }
 
     Serial.println();
+  }
+
+  if (millis() - lastBleTelemetryMs >= BLE_TELEMETRY_PERIOD_MS) {
+    lastBleTelemetryMs = millis();
+    publishBleTelemetry();
   }
 
   delay(2);

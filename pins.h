@@ -13,7 +13,7 @@
     GPIO14  INA180 fan-current ADC
     GPIO16  MAX98357A BCLK
     GPIO17  MAX98357A LRCLK
-    GPIO18  MAX98357A DIN *AND final SK6805 DOUT on Rev-A netlist*
+    GPIO18  MAX98357A DIN (D3 DOUT trace cut on reworked Rev-A hardware)
     GPIO26  SK6805 DIN
     GPIO36  FUSB303 OUT1
     GPIO37  FUSB303 OUT2
@@ -35,7 +35,7 @@ constexpr uint8_t PIN_FAN_CURRENT   = 14;
 
 constexpr uint8_t PIN_AUDIO_BCLK    = 16;
 constexpr uint8_t PIN_AUDIO_LRCLK   = 17;
-constexpr uint8_t PIN_AUDIO_DIN     = 18; // DO NOT DRIVE on Rev-A until net conflict is resolved.
+constexpr uint8_t PIN_AUDIO_DIN     = 18;
 
 constexpr uint8_t PIN_RGB_DATA      = 26;
 

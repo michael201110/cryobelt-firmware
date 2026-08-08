@@ -15,9 +15,21 @@ public:
 
   bool setChargingEnabled(bool enabled);
   bool setOTGEnabled(bool enabled);
+  bool setPowerModes(bool chargingEnabled, bool otgEnabled);
   bool setILIMPinEnabled(bool enabled);
   bool setInputCurrentLimitmA(uint16_t milliamps);
-  bool resetWatchdog();
+  bool setChargeCurrentmA(uint16_t milliamps);
+  bool setChargeVoltagemV(uint16_t millivolts);
+  bool setPrechargeCurrentmA(uint16_t milliamps);
+  bool setTerminationCurrentmA(uint16_t milliamps);
+  bool disableAutonomousInputDetection();
+  bool disableWatchdog();
+  bool configureSafetyTimer();
+  bool setInputVoltageLimitmV(uint16_t millivolts);
+  bool enableContinuousADC();
+  bool readBatteryMillivolts(uint16_t& millivolts);
+  bool verifyConfiguration(bool chargingExpected, Stream* diagnostics = nullptr);
+  bool readStatus(uint8_t& status, uint8_t& fault);
 
   void dumpRegisters(Stream& out);
 
