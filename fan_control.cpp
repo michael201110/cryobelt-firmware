@@ -26,7 +26,11 @@ void FanControl::begin(uint8_t pwmPin, uint8_t currentPin) {
 }
 
 void FanControl::setPercent(int percent) {
-  percent_ = constrain(percent, 0, 100);
+  const int requestedPercent = constrain(percent, 0, 100);
+  if (requestedPercent != percent_) {
+    lastDutyChangeMs_ = millis();
+  }
+  percent_ = requestedPercent;
 
   const uint32_t maxDuty = (1UL << FAN_PWM_BITS) - 1UL;
   const uint32_t duty = (maxDuty * static_cast<uint32_t>(percent_)) / 100UL;
@@ -56,4 +60,35 @@ float FanControl::currentAmps() const {
 
   // INA180A3: Vout = I * Rshunt * Gain
   return volts / (FAN_SHUNT_OHMS * INA180_GAIN);
+}
+
+bool FanControl::estimatePodCount(float measuredCurrentAmps,
+                                  float supplyVoltage,
+                                  uint8_t& count) const {
+  count = 0;
+  if (!pwmAttached_ || percent_ < POD_ESTIMATE_MIN_FAN_PERCENT ||
+      millis() - lastDutyChangeMs_ < POD_ESTIMATE_SETTLE_MS ||
+      measuredCurrentAmps < 0.0f || supplyVoltage <= 0.0f) {
+    return false;
+  }
+
+  const float duty = static_cast<float>(percent_) / 100.0f;
+  const float equivalentFullPowerW = supplyVoltage * measuredCurrentAmps / duty;
+  const long estimate = lroundf(equivalentFullPowerW / POD_FAN_RATED_POWER_W);
+  count = static_cast<uint8_t>(constrain(estimate, 0L,
+                                         static_cast<long>(MAX_ESTIMATED_PODS)));
+  return true;
+}
+
+bool FanControl::exceedsPodCurrentLimit(float measuredCurrentAmps) const {
+  if (!pwmAttached_ || percent_ < POD_ESTIMATE_MIN_FAN_PERCENT ||
+      measuredCurrentAmps < 0.0f) {
+    return false;
+  }
+
+  const float duty = static_cast<float>(percent_) / 100.0f;
+  const float equivalentFullCurrentA = measuredCurrentAmps / duty;
+  const float sixPodRatedMaximumA =
+    MAX_ALLOWED_PODS * POD_FAN_MAX_CURRENT_A + POD_CURRENT_LIMIT_MARGIN_A;
+  return equivalentFullCurrentA > sixPodRatedMaximumA;
 }

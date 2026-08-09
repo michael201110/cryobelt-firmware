@@ -37,6 +37,8 @@ class CommandCallbacks final : public BLECharacteristicCallbacks {
       (opcode == static_cast<uint8_t>(CryoBeltBLE::Opcode::SET_MODE) &&
        commandValue <= 3) ||
       (opcode == static_cast<uint8_t>(CryoBeltBLE::Opcode::FIND_BELT) &&
+       commandValue == 1) ||
+      (opcode == static_cast<uint8_t>(CryoBeltBLE::Opcode::RECHECK_PODS) &&
        commandValue == 1);
     if (!valid) return;
 
@@ -133,11 +135,17 @@ void CryoBeltBLE::publish(const Telemetry& telemetry) {
     (telemetry.climateValid ? 0x02 : 0) |
     (telemetry.chargerPresent ? 0x04 : 0) |
     (telemetry.chargerConfigValid ? 0x08 : 0) |
-    (telemetry.chargingAuthorised ? 0x10 : 0);
+    (telemetry.chargingAuthorised ? 0x10 : 0) |
+    (telemetry.podEstimateValid ? 0x20 : 0) |
+    (telemetry.podSafetyLatched ? 0x40 : 0) |
+    (telemetry.podCheckActive ? 0x80 : 0);
   packet[2] = constrain(telemetry.requestedFanPercent, 0, 100);
   packet[3] = constrain(telemetry.actualFanPercent, 0, 100);
   packet[4] = static_cast<uint8_t>(telemetry.mode);
-  packet[5] = telemetry.usbRole;
+  packet[5] = static_cast<uint8_t>(
+    (constrain(telemetry.estimatedPodCount, 0, 15) << 4) |
+    (telemetry.usbRole & 0x0F)
+  );
 
   const int16_t temperatureCenti = telemetry.climateValid
     ? static_cast<int16_t>(constrain(lroundf(telemetry.temperatureC * 100.0f),

@@ -53,6 +53,14 @@ static bool climateValid = false;
 static float lastTemperatureC = NAN;
 static float lastHumidityPercent = NAN;
 static float lastFanCurrentAmps = 0.0f;
+static bool podEstimateValid = false;
+static uint8_t estimatedPodCount = 0;
+static bool podSafetyLatched = false;
+static bool podCheckActive = false;
+static bool resumeCoolingAfterPodCheck = false;
+static uint32_t podCheckStartedMs = 0;
+static uint32_t podCheckLastSampleMs = 0;
+static uint32_t podCheckCompletedMs = 0;
 static bool chargerConfigValid = false;
 static uint16_t batteryMillivolts = 0;
 static uint8_t chargerStatus = 0;
@@ -81,7 +89,11 @@ static void setStatusColour(uint8_t r, uint8_t g, uint8_t b) {
 static void stopFindBelt() {
   if (!findBeltActive) return;
   findBeltActive = false;
-  showPixels(statusRed, statusGreen, statusBlue);
+  if (podSafetyLatched) {
+    showPixels(32, 0, 0);
+  } else {
+    showPixels(statusRed, statusGreen, statusBlue);
+  }
 }
 
 static void startFindBelt() {
@@ -131,16 +143,127 @@ static uint8_t effectiveFanPercent() {
 }
 
 static void applyCoolingOutput() {
+  if (podCheckActive) {
+    fans.setPercent(100);
+    digitalWrite(PIN_12V_EN, HIGH);
+    return;
+  }
+  if (podSafetyLatched) {
+    fans.setPercent(0);
+    digitalWrite(PIN_12V_EN, LOW);
+    return;
+  }
   const uint8_t percent = effectiveFanPercent();
   fans.setPercent(percent);
   digitalWrite(PIN_12V_EN, percent > 0 ? HIGH : LOW);
 }
 
+static void beginPodSafetyCheck(bool resumeCooling) {
+  stopFindBelt();
+  resumeCoolingAfterPodCheck = resumeCooling;
+  podCheckActive = true;
+  podCheckStartedMs = millis();
+  podCheckLastSampleMs = podCheckStartedMs;
+  podEstimateValid = false;
+  applyCoolingOutput();
+  showPixels(24, 12, 0);
+  Serial.println("[PODS] One-second safety check started.");
+}
+
+static void requestCoolingEnabled(bool enabled) {
+  if (!enabled) {
+    coolingEnabled = false;
+    podCheckActive = false;
+    applyCoolingOutput();
+    return;
+  }
+
+  if (podSafetyLatched) {
+    coolingEnabled = false;
+    applyCoolingOutput();
+    Serial.println("[PODS] Cooling blocked by latched pod limit.");
+    return;
+  }
+
+  if (!coolingEnabled) {
+    coolingEnabled = true;
+    beginPodSafetyCheck(true);
+  } else {
+    applyCoolingOutput();
+  }
+}
+
+static void latchPodSafety(const char* reason) {
+  stopFindBelt();
+  podCheckActive = false;
+  podSafetyLatched = true;
+  coolingEnabled = false;
+  applyCoolingOutput();
+  showPixels(32, 0, 0);
+  Serial.printf("[PODS] FAN RAIL DISABLED: %s\n", reason);
+}
+
+static void updatePodSafetyCheck() {
+  if (!podCheckActive) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  const uint32_t elapsed = now - podCheckStartedMs;
+  if (elapsed >= POD_ESTIMATE_SETTLE_MS &&
+      now - podCheckLastSampleMs >= POD_CHECK_SAMPLE_INTERVAL_MS) {
+    podCheckLastSampleMs = now;
+    lastFanCurrentAmps = fans.currentAmps();
+    if (fans.exceedsPodCurrentLimit(lastFanCurrentAmps)) {
+      podEstimateValid = fans.estimatePodCount(
+        lastFanCurrentAmps,
+        FAN_SUPPLY_VOLTAGE_V,
+        estimatedPodCount
+      );
+      latchPodSafety("fan current exceeds the six-pod limit");
+      return;
+    }
+  }
+
+  if (elapsed < POD_RECHECK_DURATION_MS) return;
+
+  lastFanCurrentAmps = fans.currentAmps();
+  podEstimateValid = fans.estimatePodCount(
+    lastFanCurrentAmps,
+    FAN_SUPPLY_VOLTAGE_V,
+    estimatedPodCount
+  );
+
+  if (!podEstimateValid) {
+    latchPodSafety("current measurement was not valid");
+    return;
+  }
+  if (estimatedPodCount > MAX_ALLOWED_PODS) {
+    latchPodSafety("estimated pod count exceeds six");
+    return;
+  }
+
+  podCheckActive = false;
+  podSafetyLatched = false;
+  podCheckCompletedMs = now;
+  coolingEnabled = resumeCoolingAfterPodCheck;
+  applyCoolingOutput();
+  showPixels(statusRed, statusGreen, statusBlue);
+  Serial.printf("[PODS] Check passed: approximately %u pod(s).\n",
+                estimatedPodCount);
+}
+
+static void startPeriodicPodCheckIfDue() {
+  if (!coolingEnabled || podSafetyLatched || podCheckActive) return;
+  if (millis() - podCheckCompletedMs >= POD_PERIODIC_RECHECK_MS) {
+    beginPodSafetyCheck(true);
+  }
+}
+
 static void handleBleCommands() {
   if (beltBLE.takeDisconnected()) {
     stopFindBelt();
-    coolingEnabled = false;
-    applyCoolingOutput();
+    requestCoolingEnabled(false);
     Serial.println("[BLE] Disconnected; cooling stopped.");
   }
 
@@ -148,7 +271,7 @@ static void handleBleCommands() {
   while (beltBLE.takeCommand(command)) {
     switch (command.opcode) {
       case CryoBeltBLE::Opcode::SET_POWER:
-        coolingEnabled = command.value != 0;
+        requestCoolingEnabled(command.value != 0);
         break;
       case CryoBeltBLE::Opcode::SET_FAN_PERCENT:
         requestedFanPercent = command.value;
@@ -159,6 +282,11 @@ static void handleBleCommands() {
         break;
       case CryoBeltBLE::Opcode::FIND_BELT:
         startFindBelt();
+        break;
+      case CryoBeltBLE::Opcode::RECHECK_PODS:
+        if (podSafetyLatched && !podCheckActive) {
+          beginPodSafetyCheck(false);
+        }
         break;
     }
     applyCoolingOutput();
@@ -176,10 +304,14 @@ static void publishBleTelemetry() {
     charger.isPresent(),
     chargerConfigValid,
     chargingAuthorised,
+    podEstimateValid,
+    podSafetyLatched,
+    podCheckActive,
     requestedFanPercent,
     static_cast<uint8_t>(fans.percent()),
     coolingMode,
     static_cast<uint8_t>(usbRole.role()),
+    estimatedPodCount,
     lastTemperatureC,
     lastHumidityPercent,
     lastFanCurrentAmps,
@@ -339,6 +471,8 @@ void loop() {
   buttons.update();
   usbRole.update();
   handleBleCommands();
+  updatePodSafetyCheck();
+  startPeriodicPodCheckIfDue();
   updateFindBelt();
 
   // Simple UI:
@@ -350,8 +484,7 @@ void loop() {
       requestedFanPercent = requestedFanPercent <= 90
         ? requestedFanPercent + 10 : 100;
       coolingMode = CryoBeltBLE::Mode::MANUAL;
-      coolingEnabled = requestedFanPercent > 0;
-      applyCoolingOutput();
+      requestCoolingEnabled(requestedFanPercent > 0);
       Serial.printf("[UI] Fan %u%%\n", requestedFanPercent);
       lastButtonMs = millis();
     }
@@ -360,15 +493,13 @@ void loop() {
       requestedFanPercent = requestedFanPercent >= 10
         ? requestedFanPercent - 10 : 0;
       coolingMode = CryoBeltBLE::Mode::MANUAL;
-      coolingEnabled = requestedFanPercent > 0;
-      applyCoolingOutput();
+      requestCoolingEnabled(requestedFanPercent > 0);
       Serial.printf("[UI] Fan %u%%\n", requestedFanPercent);
       lastButtonMs = millis();
     }
 
     if (buttons.userPressed()) {
-      coolingEnabled = !coolingEnabled;
-      applyCoolingOutput();
+      requestCoolingEnabled(!coolingEnabled);
       Serial.printf("[UI] Fan %d%%\n", fans.percent());
       lastButtonMs = millis();
     }
@@ -379,11 +510,29 @@ void loop() {
 
     climateValid = climate.read(lastTemperatureC, lastHumidityPercent);
     lastFanCurrentAmps = fans.currentAmps();
+    if (!podSafetyLatched && !podCheckActive) {
+      podEstimateValid = fans.estimatePodCount(
+        lastFanCurrentAmps,
+        FAN_SUPPLY_VOLTAGE_V,
+        estimatedPodCount
+      );
+      if (podEstimateValid && estimatedPodCount > MAX_ALLOWED_PODS) {
+        latchPodSafety("estimated pod count exceeds six");
+      } else if (fans.exceedsPodCurrentLimit(lastFanCurrentAmps)) {
+        latchPodSafety("fan current exceeds the six-pod limit");
+      }
+    }
 
     Serial.printf("[TEL] Fan=%d%%  I_fan=%.3f A  USB=%s",
                   fans.percent(),
                   lastFanCurrentAmps,
                   usbRole.description());
+
+    if (podEstimateValid) {
+      Serial.printf("  PODS~%u", estimatedPodCount);
+    } else {
+      Serial.print("  PODS=WAIT");
+    }
 
     if (climateValid) {
       Serial.printf("  T=%.2f C  RH=%.1f%%", lastTemperatureC, lastHumidityPercent);

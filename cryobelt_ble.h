@@ -3,7 +3,7 @@
 
 class CryoBeltBLE {
 public:
-  static constexpr uint8_t PROTOCOL_VERSION = 1;
+  static constexpr uint8_t PROTOCOL_VERSION = 3;
   static constexpr size_t TELEMETRY_SIZE = 16;
 
   enum class Opcode : uint8_t {
@@ -11,6 +11,7 @@ public:
     SET_FAN_PERCENT = 2,
     SET_MODE = 3,
     FIND_BELT = 4,
+    RECHECK_PODS = 5,
   };
 
   enum class Mode : uint8_t {
@@ -31,10 +32,14 @@ public:
     bool chargerPresent;
     bool chargerConfigValid;
     bool chargingAuthorised;
+    bool podEstimateValid;
+    bool podSafetyLatched;
+    bool podCheckActive;
     uint8_t requestedFanPercent;
     uint8_t actualFanPercent;
     Mode mode;
     uint8_t usbRole;
+    uint8_t estimatedPodCount;
     float temperatureC;
     float humidityPercent;
     float fanCurrentAmps;

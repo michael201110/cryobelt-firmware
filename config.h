@@ -27,6 +27,21 @@ constexpr int DEFAULT_FAN_PERCENT = 40;
 constexpr uint32_t FAN_PWM_HZ = 25000;
 constexpr uint8_t FAN_PWM_BITS = 10;
 
+// One pod contains one CFM-5010V-155-310 fan. Manufacturer ratings are
+// 12 V, 81 mA maximum, and 0.98 W. The +12 V fan rail is not measured on
+// Rev-A, so the estimator uses its nominal regulated voltage.
+constexpr float FAN_SUPPLY_VOLTAGE_V = 12.0f;
+constexpr float POD_FAN_RATED_POWER_W = 0.98f;
+constexpr float POD_FAN_MAX_CURRENT_A = 0.081f;
+constexpr uint8_t POD_ESTIMATE_MIN_FAN_PERCENT = 40;
+constexpr uint32_t POD_ESTIMATE_SETTLE_MS = 750;
+constexpr uint8_t MAX_ESTIMATED_PODS = 8;
+constexpr uint8_t MAX_ALLOWED_PODS = 6;
+constexpr uint32_t POD_RECHECK_DURATION_MS = 1000;
+constexpr uint32_t POD_CHECK_SAMPLE_INTERVAL_MS = 50;
+constexpr uint32_t POD_PERIODIC_RECHECK_MS = 30000;
+constexpr float POD_CURRENT_LIMIT_MARGIN_A = 0.010f;
+
 constexpr uint32_t TELEMETRY_PERIOD_MS = 2000;
 constexpr uint32_t BLE_TELEMETRY_PERIOD_MS = 1000;
 

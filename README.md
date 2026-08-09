@@ -26,13 +26,13 @@ firmware advertises as `CryoBelt` and exposes service
 `7d4b1000-6c4a-4f65-9f09-8a2c7d3e1000`.
 
 - Command characteristic `...1001` accepts exactly three bytes: protocol
-  version (`1`), opcode, and value. Opcodes are power (`1`, value 0/1), fan
+  version (`3`), opcode, and value. Opcodes are power (`1`, value 0/1), fan
   percent (`2`, value 0-100), mode (`3`, value 0-3), and Find My Belt
-  (`4`, value 1).
+  (`4`, value 1). Pod safety recheck uses opcode `5`, value `1`.
 - Telemetry characteristic `...1002` is readable and notifiable. Its fixed
   16-byte packet carries state flags, requested/actual fan level, mode, USB
-  role, temperature, humidity, fan current, battery voltage, and BQ25895
-  status/fault bytes.
+  role, estimated pod count, temperature, humidity, fan current, battery
+  voltage, and BQ25895 status/fault bytes.
 
 Cooling is switched off when the BLE client disconnects. Remote commands never
 enable charging or OTG; those remain governed by the firmware safety
@@ -166,6 +166,36 @@ So:
 `I_fan = Vout / (100 * 0.05) = Vout / 5`
 
 Example: 3.0 V at the INA180 output corresponds to about 0.6 A.
+
+## Pod-count estimate
+
+Each pod contains one CFM-5010V-155-310 fan, rated for 12 V, 81 mA maximum,
+and 0.98 W. Once fan output has been stable for 0.75 seconds at 40% or more, the
+firmware calculates:
+
+`pods = round((12 V * measured current / PWM duty) / 0.98 W)`
+
+The result is clamped to eight pods because the Rev-A INA180A3 and ESP32 ADC
+range can measure only about 0.66 A. This is an estimate: fan unit variation,
+air restriction, PWM behaviour, and the unmeasured +12 V rail affect accuracy.
+Calibrate `POD_FAN_RATED_POWER_W` using one real pod before relying on the count.
+
+Separately from the rounded count, firmware trips when PWM-normalized fan
+current exceeds 496 mA: six fans at the 81 mA nameplate maximum plus a 10 mA
+measurement margin. During each safety pulse this limit is sampled every 50 ms
+after the 750 ms settling period.
+
+Cooling startup first runs a one-second, full-duty pod check. An estimate above
+six latches the 12 V fan rail off and reports a warning to the app. After pods
+are removed, the user must explicitly confirm a one-second recheck in the app;
+the rail remains off after a successful recheck until cooling is requested
+again. A failed or invalid recheck remains latched off.
+
+While cooling remains active, firmware repeats the full-duty safety pulse every
+30 seconds. This bounds the low-duty hot-plug detection delay, but it produces a
+brief full-speed fan event. Current-only detection is not safety-rated until
+the thresholds are calibrated with physical pods across voltage, temperature,
+and airflow conditions.
 
 ## Status
 
