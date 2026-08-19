@@ -17,6 +17,8 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_NeoPixel.h>
+#include <esp_arduino_version.h>
+#include <esp_task_wdt.h>
 
 #include "pins.h"
 #include "config.h"
@@ -60,8 +62,12 @@ static bool podCheckActive = false;
 static bool resumeCoolingAfterPodCheck = false;
 static uint32_t podCheckStartedMs = 0;
 static uint32_t podCheckLastSampleMs = 0;
+static uint32_t podCheckLastRampMs = 0;
 static uint32_t podCheckCompletedMs = 0;
+static uint8_t podCheckRampPercent = 0;
 static bool chargerConfigValid = false;
+static bool chargerSafetyLatched = false;
+static uint32_t lastChargerHealthMs = 0;
 static uint16_t batteryMillivolts = 0;
 static uint8_t chargerStatus = 0;
 static uint8_t chargerFault = 0;
@@ -71,6 +77,7 @@ static uint8_t statusBlue = 0;
 static bool findBeltActive = false;
 static uint32_t findBeltStartedMs = 0;
 static uint32_t findBeltLastStep = UINT32_MAX;
+static bool systemWatchdogArmed = false;
 
 static void showPixels(uint8_t r, uint8_t g, uint8_t b) {
   for (uint8_t i = 0; i < RGB_COUNT; ++i) {
@@ -144,7 +151,7 @@ static uint8_t effectiveFanPercent() {
 
 static void applyCoolingOutput() {
   if (podCheckActive) {
-    fans.setPercent(100);
+    fans.setPercent(podCheckRampPercent);
     digitalWrite(PIN_12V_EN, HIGH);
     return;
   }
@@ -164,10 +171,12 @@ static void beginPodSafetyCheck(bool resumeCooling) {
   podCheckActive = true;
   podCheckStartedMs = millis();
   podCheckLastSampleMs = podCheckStartedMs;
+  podCheckLastRampMs = podCheckStartedMs;
+  podCheckRampPercent = 0;
   podEstimateValid = false;
   applyCoolingOutput();
   showPixels(24, 12, 0);
-  Serial.println("[PODS] One-second safety check started.");
+  Serial.println("[PODS] Current-limited fan ramp started.");
 }
 
 static void requestCoolingEnabled(bool enabled) {
@@ -196,6 +205,7 @@ static void requestCoolingEnabled(bool enabled) {
 static void latchPodSafety(const char* reason) {
   stopFindBelt();
   podCheckActive = false;
+  podCheckRampPercent = 0;
   podSafetyLatched = true;
   coolingEnabled = false;
   applyCoolingOutput();
@@ -210,11 +220,17 @@ static void updatePodSafetyCheck() {
 
   const uint32_t now = millis();
   const uint32_t elapsed = now - podCheckStartedMs;
-  if (elapsed >= POD_ESTIMATE_SETTLE_MS &&
-      now - podCheckLastSampleMs >= POD_CHECK_SAMPLE_INTERVAL_MS) {
+
+  if (elapsed >= POD_CHECK_TIMEOUT_MS) {
+    latchPodSafety("fan safety check timed out");
+    return;
+  }
+
+  if (now - podCheckLastSampleMs >= POD_CHECK_SAMPLE_INTERVAL_MS) {
     podCheckLastSampleMs = now;
     lastFanCurrentAmps = fans.currentAmps();
-    if (fans.exceedsPodCurrentLimit(lastFanCurrentAmps)) {
+    if (fans.exceedsAbsoluteCurrentLimit(lastFanCurrentAmps) ||
+        fans.exceedsPodCurrentLimit(lastFanCurrentAmps)) {
       podEstimateValid = fans.estimatePodCount(
         lastFanCurrentAmps,
         FAN_SUPPLY_VOLTAGE_V,
@@ -225,7 +241,21 @@ static void updatePodSafetyCheck() {
     }
   }
 
-  if (elapsed < POD_RECHECK_DURATION_MS) return;
+  if (elapsed < POD_BOOST_SETTLE_MS) return;
+
+  if (podCheckRampPercent < POD_CHECK_FAN_PERCENT) {
+    if (now - podCheckLastRampMs < POD_RAMP_STEP_MS) return;
+    podCheckLastRampMs = now;
+    const uint8_t nextPercent = static_cast<uint8_t>(min(
+      static_cast<unsigned>(POD_CHECK_FAN_PERCENT),
+      static_cast<unsigned>(podCheckRampPercent + POD_RAMP_STEP_PERCENT)
+    ));
+    podCheckRampPercent = nextPercent;
+    applyCoolingOutput();
+    return;
+  }
+
+  if (now - podCheckLastRampMs < POD_ESTIMATE_SETTLE_MS) return;
 
   lastFanCurrentAmps = fans.currentAmps();
   podEstimateValid = fans.estimatePodCount(
@@ -244,6 +274,7 @@ static void updatePodSafetyCheck() {
   }
 
   podCheckActive = false;
+  podCheckRampPercent = 0;
   podSafetyLatched = false;
   podCheckCompletedMs = now;
   coolingEnabled = resumeCoolingAfterPodCheck;
@@ -324,6 +355,7 @@ static void publishBleTelemetry() {
 
 static void forceChargerSafe() {
   stopFindBelt();
+  chargingAuthorised = false;
   chargerConfigValid = false;
   // Best effort, deliberately ordered so the hardware ILIM clamp is restored
   // even if another register transaction fails.
@@ -393,6 +425,7 @@ static void initialiseChargerSafely() {
   }
 
   chargerConfigValid = true;
+  chargerSafetyLatched = false;
 
   Serial.printf("[BQ] Configured. Charge=%s, IINLIM=%u mA, ICHG=%u mA\n",
                 chargingAuthorised ? "ON" : "INHIBITED",
@@ -401,6 +434,70 @@ static void initialiseChargerSafely() {
   setStatusColour(chargingAuthorised ? 0 : 20,
                   chargingAuthorised ? 20 : 12,
                   0);
+}
+
+static void beginSystemWatchdog() {
+  esp_err_t result = ESP_OK;
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  const esp_task_wdt_config_t watchdogConfig = {
+    .timeout_ms = SYSTEM_WATCHDOG_TIMEOUT_MS,
+    .idle_core_mask = 0,
+    .trigger_panic = true,
+  };
+  result = esp_task_wdt_reconfigure(&watchdogConfig);
+  if (result == ESP_ERR_INVALID_STATE) {
+    result = esp_task_wdt_init(&watchdogConfig);
+  }
+#else
+  result = esp_task_wdt_init(
+    static_cast<uint32_t>((SYSTEM_WATCHDOG_TIMEOUT_MS + 999) / 1000),
+    true
+  );
+  if (result == ESP_ERR_INVALID_STATE) result = ESP_OK;
+#endif
+  if (result == ESP_OK) {
+    result = esp_task_wdt_add(nullptr);
+  }
+  systemWatchdogArmed = result == ESP_OK;
+  Serial.printf("[WDT] Loop watchdog %s.\n",
+                systemWatchdogArmed ? "armed" : "FAILED");
+}
+
+static void updateChargerHealth() {
+  if (chargerSafetyLatched) return;
+  const uint32_t now = millis();
+  if (digitalRead(PIN_BQ_INT_N) != LOW &&
+      now - lastChargerHealthMs < CHARGER_HEALTH_PERIOD_MS) {
+    return;
+  }
+  lastChargerHealthMs = now;
+
+  if (!charger.isPresent()) {
+    // An I2C loss after successful configuration is itself safety-critical:
+    // the charger may still be operating even though firmware cannot verify it.
+    if (chargerConfigValid || chargingAuthorised) {
+      chargerSafetyLatched = true;
+      Serial.println("[BQ] Safety latch: charger stopped responding.");
+      forceChargerSafe();
+      setStatusColour(32, 0, 0);
+    }
+    return;
+  }
+
+  const bool configValid =
+    charger.verifyConfiguration(chargingAuthorised, &Serial);
+  const bool statusValid = charger.readStatus(chargerStatus, chargerFault);
+  const bool batteryValid = charger.readBatteryMillivolts(batteryMillivolts);
+  if (!configValid || !statusValid || !batteryValid || chargerFault != 0) {
+    chargerSafetyLatched = true;
+    chargerConfigValid = false;
+    Serial.printf("[BQ] Safety latch: config=%u status=%u battery=%u fault=0x%02X\n",
+                  configValid, statusValid, batteryValid, chargerFault);
+    forceChargerSafe();
+    setStatusColour(32, 0, 0);
+    return;
+  }
+  chargerConfigValid = true;
 }
 
 void setup() {
@@ -464,16 +561,20 @@ void setup() {
     Serial.println("[BLE] Initialisation failed; local controls remain available.");
   }
 
+  // Arm the loop watchdog only after potentially slow peripheral startup.
+  beginSystemWatchdog();
   Serial.println("[BOOT] Firmware ready.");
 }
 
 void loop() {
+  if (systemWatchdogArmed) esp_task_wdt_reset();
   buttons.update();
   usbRole.update();
   handleBleCommands();
   updatePodSafetyCheck();
   startPeriodicPodCheckIfDue();
   updateFindBelt();
+  updateChargerHealth();
 
   // Simple UI:
   // UP   = +10% fan
@@ -539,21 +640,9 @@ void loop() {
     }
 
     if (charger.isPresent()) {
-      chargerConfigValid = charger.verifyConfiguration(chargingAuthorised, &Serial);
-      if (!chargerConfigValid) {
-        Serial.print("  BQ_CONFIG=INVALID");
-        chargingAuthorised = false;
-        forceChargerSafe();
-        setStatusColour(32, 0, 0);
-      } else if (charger.readStatus(chargerStatus, chargerFault)) {
-        if (!charger.readBatteryMillivolts(batteryMillivolts)) {
-          batteryMillivolts = 0;
-        }
-        Serial.printf("  BQ_STATUS=0x%02X  BQ_FAULT=0x%02X  VBAT=%u mV",
-                      chargerStatus, chargerFault, batteryMillivolts);
-      } else {
-        Serial.print("  BQ_READ=ERROR");
-      }
+      Serial.printf("  BQ_CONFIG=%s  BQ_STATUS=0x%02X  BQ_FAULT=0x%02X  VBAT=%u mV",
+                    chargerConfigValid ? "OK" : "LATCHED",
+                    chargerStatus, chargerFault, batteryMillivolts);
     }
 
     Serial.println();

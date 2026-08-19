@@ -18,6 +18,8 @@ Initial firmware skeleton for the custom CryoBelt ESP32-S3-MINI-1-N8 PCB.
 - OTG gate defaults safely OFF
 - Bluetooth LE control and telemetry for the companion Flutter app
 - MAX98357A I2S audio on reworked Rev-A boards
+- Encrypted BLE bonding gated by holding the physical USER button
+- ESP32 loop watchdog and latched charger-health monitoring
 
 ## Companion app and BLE protocol
 
@@ -37,6 +39,11 @@ firmware advertises as `CryoBelt` and exposes service
 Cooling is switched off when the BLE client disconnects. Remote commands never
 enable charging or OTG; those remain governed by the firmware safety
 interlocks.
+
+Command writes and telemetry access require an encrypted BLE bond. For a new
+phone, hold the physical USER button while the app makes its first connection.
+Previously bonded phones reconnect without holding the button. Remove the bond
+in the phone Bluetooth settings before deliberately pairing a replacement.
 
 Find My Belt flashes the three status LEDs blue and emits a short chirp once per
 second for eight seconds. It stops automatically or immediately on BLE
@@ -133,9 +140,9 @@ Continuity testing confirmed that GPIO18 remains connected to MAX98357A `DIN`
 and is isolated from D3 `DOUT`. The firmware therefore enables I2S and plays a
 short, low-volume two-tone confirmation during startup.
 
-Do not flash this audio-enabled configuration onto an unreworked Rev-A board.
-Set `AUDIO_HARDWARE_REWORKED` to `false` in `config.h` for any PCB that has not
-had the trace cut and verified.
+Audio now fails closed. The normal build leaves it disabled. Only add
+`-DCRYOBELT_AUDIO_HARDWARE_REWORKED=1` to a board-specific build after the
+trace cut and continuity test have been completed on that exact PCB.
 
 ## First hardware bring-up order
 
@@ -156,16 +163,17 @@ Recommended sequence once components arrive:
 
 ## Current-sense conversion
 
-Rev-A uses:
+The updated production BOM uses:
 
-- Rshunt = 0.05 ohm
+- R25 shunt = 0.01 ohm
 - INA180A3 gain = 100 V/V
+- Current-sense transfer = 1 V/A
 
 So:
 
-`I_fan = Vout / (100 * 0.05) = Vout / 5`
+`I_fan = Vout / (100 * 0.01) = Vout / 1`
 
-Example: 3.0 V at the INA180 output corresponds to about 0.6 A.
+Example: 0.60 V at the INA180 output corresponds to about 0.60 A.
 
 ## Pod-count estimate
 
@@ -175,27 +183,32 @@ firmware calculates:
 
 `pods = round((12 V * measured current / PWM duty) / 0.98 W)`
 
-The result is clamped to eight pods because the Rev-A INA180A3 and ESP32 ADC
-range can measure only about 0.66 A. This is an estimate: fan unit variation,
-air restriction, PWM behaviour, and the unmeasured +12 V rail affect accuracy.
-Calibrate `POD_FAN_RATED_POWER_W` using one real pod before relying on the count.
+The result is clamped to the firmware's supported maximum of eight pods. With
+the production BOM's 1 V/A transfer, the ESP32 ADC is no longer close to
+saturation at the six-pod current ceiling. This is still an estimate: fan unit
+variation, air restriction, PWM behaviour, and the unmeasured +12 V rail affect
+accuracy. Calibrate `POD_FAN_RATED_POWER_W` using one real pod before relying on
+the count.
 
-Separately from the rounded count, firmware trips when PWM-normalized fan
-current exceeds 496 mA: six fans at the 81 mA nameplate maximum plus a 10 mA
-measurement margin. During each safety pulse this limit is sampled every 50 ms
-after the 750 ms settling period.
+Separately from the rounded count, firmware uses 496 mA as the absolute
+six-pod current ceiling: six fans at the 81 mA nameplate maximum plus a 10 mA
+measurement margin. It samples that ceiling every 25 ms throughout the ramp
+and also applies the PWM-normalized ceiling once duty reaches 40%.
 
-Cooling startup first runs a one-second, full-duty pod check. An estimate above
-six latches the 12 V fan rail off and reports a warning to the app. After pods
-are removed, the user must explicitly confirm a one-second recheck in the app;
-the rail remains off after a successful recheck until cooling is requested
-again. A failed or invalid recheck remains latched off.
+Cooling startup now enables the 12 V rail at zero fan duty, then ramps from 0%
+to 40% in 5% steps while sampling current every 25 ms. Absolute overcurrent,
+PWM-normalized overcurrent, an invalid estimate, or a 2.5-second timeout latches
+the fan rail off. Only after the final 40% duty has settled for 750 ms is the
+pod estimate accepted. After pods are removed, the user must explicitly confirm
+another current-limited recheck in the app; the rail remains off after a
+successful recheck until cooling is requested again.
 
-While cooling remains active, firmware repeats the full-duty safety pulse every
-30 seconds. This bounds the low-duty hot-plug detection delay, but it produces a
-brief full-speed fan event. Current-only detection is not safety-rated until
-the thresholds are calibrated with physical pods across voltage, temperature,
-and airflow conditions.
+While cooling remains active, firmware repeats the same current-limited ramp
+every 30 seconds. Current-only detection is not safety-rated until the
+thresholds are calibrated with physical pods across voltage, temperature,
+airflow, motor startup, and blocked-rotor conditions. Hardware current limiting
+remains necessary because firmware cannot protect against every short or MCU
+failure.
 
 ## Status
 

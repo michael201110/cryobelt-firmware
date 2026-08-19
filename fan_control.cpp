@@ -58,8 +58,8 @@ float FanControl::currentAmps() const {
   mv /= samples;
   float volts = static_cast<float>(mv) / 1000.0f;
 
-  // INA180A3: Vout = I * Rshunt * Gain
-  return volts / (FAN_SHUNT_OHMS * INA180_GAIN);
+  // Production BOM: 10 mOhm R25 * INA180A3 gain 100 = 1 V/A.
+  return volts / FAN_CURRENT_SENSE_VOLTS_PER_AMP;
 }
 
 bool FanControl::estimatePodCount(float measuredCurrentAmps,
@@ -91,4 +91,11 @@ bool FanControl::exceedsPodCurrentLimit(float measuredCurrentAmps) const {
   const float sixPodRatedMaximumA =
     MAX_ALLOWED_PODS * POD_FAN_MAX_CURRENT_A + POD_CURRENT_LIMIT_MARGIN_A;
   return equivalentFullCurrentA > sixPodRatedMaximumA;
+}
+
+bool FanControl::exceedsAbsoluteCurrentLimit(float measuredCurrentAmps) const {
+  if (!pwmAttached_ || measuredCurrentAmps < 0.0f) return false;
+  const float sixPodRatedMaximumA =
+    MAX_ALLOWED_PODS * POD_FAN_MAX_CURRENT_A + POD_CURRENT_LIMIT_MARGIN_A;
+  return measuredCurrentAmps > sixPodRatedMaximumA;
 }

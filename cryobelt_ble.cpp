@@ -2,8 +2,12 @@
 
 #include <BLE2902.h>
 #include <BLEDevice.h>
+#include <BLESecurity.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
+#include <esp_arduino_version.h>
+
+#include "pins.h"
 
 namespace {
 
@@ -14,8 +18,12 @@ constexpr char TELEMETRY_UUID[] = "7d4b1002-6c4a-4f65-9f09-8a2c7d3e1000";
 
 portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
 BLECharacteristic* telemetryCharacteristic = nullptr;
-volatile uint8_t pendingOpcode = 0;
-volatile uint8_t pendingValue = 0;
+constexpr uint8_t COMMAND_QUEUE_SIZE = 8;
+uint8_t pendingOpcodes[COMMAND_QUEUE_SIZE] = {};
+uint8_t pendingValues[COMMAND_QUEUE_SIZE] = {};
+uint8_t commandQueueHead = 0;
+uint8_t commandQueueTail = 0;
+uint8_t commandQueueCount = 0;
 volatile bool clientConnected = false;
 volatile bool clientDisconnected = false;
 
@@ -43,8 +51,22 @@ class CommandCallbacks final : public BLECharacteristicCallbacks {
     if (!valid) return;
 
     portENTER_CRITICAL(&stateMux);
-    pendingValue = commandValue;
-    pendingOpcode = opcode;
+    const bool emergencyStop =
+      opcode == static_cast<uint8_t>(CryoBeltBLE::Opcode::SET_POWER) &&
+      commandValue == 0;
+    if (emergencyStop) {
+      commandQueueHead = 0;
+      commandQueueTail = 0;
+      commandQueueCount = 0;
+    }
+    if (commandQueueCount < COMMAND_QUEUE_SIZE) {
+      pendingOpcodes[commandQueueTail] = opcode;
+      pendingValues[commandQueueTail] = commandValue;
+      commandQueueTail = static_cast<uint8_t>(
+        (commandQueueTail + 1) % COMMAND_QUEUE_SIZE
+      );
+      ++commandQueueCount;
+    }
     portEXIT_CRITICAL(&stateMux);
   }
 };
@@ -58,19 +80,62 @@ class ServerCallbacks final : public BLEServerCallbacks {
     portENTER_CRITICAL(&stateMux);
     clientConnected = false;
     clientDisconnected = true;
-    pendingOpcode = 0;
+    commandQueueHead = 0;
+    commandQueueTail = 0;
+    commandQueueCount = 0;
     portEXIT_CRITICAL(&stateMux);
     BLEDevice::startAdvertising();
   }
 };
 
+class SecurityCallbacks final : public BLESecurityCallbacks {
+  uint32_t onPassKeyRequest() override { return 0; }
+  void onPassKeyNotify(uint32_t) override {}
+  bool onConfirmPIN(uint32_t) override { return false; }
+
+  bool onSecurityRequest() override {
+    // Physical-presence gate for first-time bonding. Existing bonds can
+    // re-encrypt without repeating this pairing request.
+    return digitalRead(PIN_BUTTON_USER) == LOW;
+  }
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3 && defined(CONFIG_NIMBLE_ENABLED)
+  void onAuthenticationComplete(ble_gap_conn_desc* result) override {
+    if (result == nullptr) {
+      Serial.println("[BLE] Pairing failed.");
+    }
+  }
+#else
+  void onAuthenticationComplete(esp_ble_auth_cmpl_t result) override {
+    if (!result.success) {
+      Serial.printf("[BLE] Pairing failed, reason=0x%02X.\n",
+                    result.fail_reason);
+    }
+  }
+#endif
+};
+
 CommandCallbacks commandCallbacks;
 ServerCallbacks serverCallbacks;
+SecurityCallbacks securityCallbacks;
+BLESecurity security;
 
 } // namespace
 
 bool CryoBeltBLE::begin() {
   BLEDevice::init(DEVICE_NAME);
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  security.setAuthenticationMode(true, false, true);
+#else
+  BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT_NO_MITM);
+  security.setAuthenticationMode(ESP_LE_AUTH_REQ_SC_BOND);
+#endif
+  BLEDevice::setSecurityCallbacks(&securityCallbacks);
+  security.setCapability(ESP_IO_CAP_NONE);
+  security.setKeySize(16);
+  security.setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+  security.setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+
   BLEServer* server = BLEDevice::createServer();
   if (!server) return false;
   server->setCallbacks(&serverCallbacks);
@@ -88,8 +153,14 @@ bool CryoBeltBLE::begin() {
   );
   if (!commandCharacteristic || !telemetryCharacteristic) return false;
 
+  commandCharacteristic->setAccessPermissions(ESP_GATT_PERM_WRITE_ENCRYPTED);
+  telemetryCharacteristic->setAccessPermissions(ESP_GATT_PERM_READ_ENCRYPTED);
   commandCharacteristic->setCallbacks(&commandCallbacks);
-  telemetryCharacteristic->addDescriptor(new BLE2902());
+  BLE2902* telemetryDescriptor = new BLE2902();
+  telemetryDescriptor->setAccessPermissions(
+    ESP_GATT_PERM_READ_ENCRYPTED | ESP_GATT_PERM_WRITE_ENCRYPTED
+  );
+  telemetryCharacteristic->addDescriptor(telemetryDescriptor);
 
   uint8_t initial[TELEMETRY_SIZE] = {};
   initial[0] = PROTOCOL_VERSION;
@@ -107,14 +178,17 @@ bool CryoBeltBLE::begin() {
 
 bool CryoBeltBLE::takeCommand(Command& command) {
   portENTER_CRITICAL(&stateMux);
-  const uint8_t opcode = pendingOpcode;
-  if (opcode != 0) {
-    command.opcode = static_cast<Opcode>(opcode);
-    command.value = pendingValue;
-    pendingOpcode = 0;
+  const bool available = commandQueueCount != 0;
+  if (available) {
+    command.opcode = static_cast<Opcode>(pendingOpcodes[commandQueueHead]);
+    command.value = pendingValues[commandQueueHead];
+    commandQueueHead = static_cast<uint8_t>(
+      (commandQueueHead + 1) % COMMAND_QUEUE_SIZE
+    );
+    --commandQueueCount;
   }
   portEXIT_CRITICAL(&stateMux);
-  return opcode != 0;
+  return available;
 }
 
 bool CryoBeltBLE::takeDisconnected() {

@@ -11,6 +11,7 @@ public:
                         float supplyVoltage,
                         uint8_t& count) const;
   bool exceedsPodCurrentLimit(float measuredCurrentAmps) const;
+  bool exceedsAbsoluteCurrentLimit(float measuredCurrentAmps) const;
 
 private:
   uint8_t pwmPin_ = 255;

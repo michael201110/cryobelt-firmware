@@ -37,17 +37,26 @@ constexpr uint8_t POD_ESTIMATE_MIN_FAN_PERCENT = 40;
 constexpr uint32_t POD_ESTIMATE_SETTLE_MS = 750;
 constexpr uint8_t MAX_ESTIMATED_PODS = 8;
 constexpr uint8_t MAX_ALLOWED_PODS = 6;
-constexpr uint32_t POD_RECHECK_DURATION_MS = 1000;
-constexpr uint32_t POD_CHECK_SAMPLE_INTERVAL_MS = 50;
+constexpr uint8_t POD_CHECK_FAN_PERCENT = 40;
+constexpr uint8_t POD_RAMP_STEP_PERCENT = 5;
+constexpr uint32_t POD_BOOST_SETTLE_MS = 100;
+constexpr uint32_t POD_RAMP_STEP_MS = 75;
+constexpr uint32_t POD_CHECK_TIMEOUT_MS = 2500;
+constexpr uint32_t POD_CHECK_SAMPLE_INTERVAL_MS = 25;
 constexpr uint32_t POD_PERIODIC_RECHECK_MS = 30000;
 constexpr float POD_CURRENT_LIMIT_MARGIN_A = 0.010f;
 
 constexpr uint32_t TELEMETRY_PERIOD_MS = 2000;
 constexpr uint32_t BLE_TELEMETRY_PERIOD_MS = 1000;
 
-// Rev-A rework verified by continuity test: GPIO18 remains connected to the
-// MAX98357A DIN input and is isolated from the final SK6805 DOUT.
-constexpr bool AUDIO_HARDWARE_REWORKED = true;
+// Fail closed unless a board-specific build explicitly confirms the Rev-A
+// GPIO18 / final-SK6805-DOUT trace rework. Set the build flag to 1 only after
+// continuity testing the exact board being flashed.
+#ifndef CRYOBELT_AUDIO_HARDWARE_REWORKED
+#define CRYOBELT_AUDIO_HARDWARE_REWORKED 0
+#endif
+constexpr bool AUDIO_HARDWARE_REWORKED =
+  CRYOBELT_AUDIO_HARDWARE_REWORKED != 0;
 constexpr uint32_t AUDIO_SAMPLE_RATE_HZ = 16000;
 constexpr uint8_t AUDIO_STARTUP_VOLUME_PERCENT = 10;
 constexpr uint32_t FIND_BELT_DURATION_MS = 8000;
@@ -55,7 +64,15 @@ constexpr uint32_t FIND_BELT_FLASH_PERIOD_MS = 250;
 constexpr uint8_t FIND_BELT_VOLUME_PERCENT = 18;
 
 // Fan current-sense:
-// Rshunt = 0.05 ohm
+// R25 = 0.01 ohm (updated production BOM)
 // INA180A3 gain = 100 V/V
-constexpr float FAN_SHUNT_OHMS = 0.05f;
+constexpr float FAN_SHUNT_OHMS = 0.01f;
 constexpr float INA180_GAIN = 100.0f;
+constexpr float FAN_CURRENT_SENSE_VOLTS_PER_AMP =
+  FAN_SHUNT_OHMS * INA180_GAIN;
+static_assert(FAN_CURRENT_SENSE_VOLTS_PER_AMP > 0.999f &&
+              FAN_CURRENT_SENSE_VOLTS_PER_AMP < 1.001f,
+              "Fan current sense must match the 1 V/A production BOM");
+
+constexpr uint32_t CHARGER_HEALTH_PERIOD_MS = 250;
+constexpr uint32_t SYSTEM_WATCHDOG_TIMEOUT_MS = 5000;
